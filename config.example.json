@@ -1,5 +1,4 @@
 {
     "student_id": "你的学号",
-    "password": "运行 campus_auth.py 后自动 DPAPI 加密填充",
-    "poll_interval": 15
+    "password": "运行 campus_auth.py 后自动 DPAPI 加密填充"
 }

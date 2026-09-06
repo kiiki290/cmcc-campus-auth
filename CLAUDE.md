@@ -27,7 +27,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - 未认证：BRAS(NetEngine) 对任意目的 `:80` 无差别 302 到 Portal，Location 带 `wlanuserip=` → 断线，且该 Location 就是认证页 URL（内含 WAN IP）。
   - 已在线：黑洞目标不可路由、永不应答 → 超时/空连接 → 在线。
   - **其余任何结局都按"在线"处理**（网络全断时也无对象可认证，静默等链路恢复后重新被 302）——见 `_get_portal_url()` / `is_offline_sync()`。
-- **认证成功 ≠ BRAS 放行**：`do_auth` 收到"登录成功"页后，用真实主机 1.1.1.1（放行=正常应答如 301 跳 https；未放行=仍 302 带 wlanuserip）毫秒级确认，按 0/1/2/3/5/8s 递增等待（总窗口 ~19s 覆盖 BRAS 慢放行，避免误触发整轮重试）。确认用真实主机而轮询用黑洞 IP，原因正好相反：放行态下黑洞探测要白等满 `PROBE_TIMEOUT`。
+- **认证成功 ≠ BRAS 放行**：`do_auth` 收到"登录成功"页后，用真实主机 1.1.1.1（放行=正常应答如 301 跳 https；未放行=仍 302 带 wlanuserip）毫秒级确认，按 0/1/2/3/5/8s 递增等待（总窗口 ~19s 覆盖 BRAS 慢放行，避免误触发整轮重试）。确认用真实主机而轮询用黑洞 IP，原因正好相反：放行态下黑洞探测要白等满 `PROBE_TIMEOUT`。（2026-09-06 起三态化：探测异常返回 None=状态未知，不烧剩余等待、直接按本轮失败交由外层重试入口探测兜底，防网络瞬断被当成"未放行"。）
 - **致命错误**：返回页含 `FATAL_PATTERNS`（密码错误/欠费/停机/冻结等）→ 抛 `FatalAuthError`，不再重试、等回车退出。
 
 ## 认证流程（do_auth，playwright chromium headless）
@@ -44,11 +44,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **每次认证/重试新建事件循环**跑 `do_auth`（`asyncio.run` 重入会崩）。单次模式的重试在 `auth_with_retry`，`--watch` 模式在 `watch_mode` 内联复制了一份同样的 3 轮重试逻辑——改重试行为时两处要同步。
 - 凭据存 `%APPDATA%\campus_auth\config.json`：`{student_id, password, poll_interval}`。password 是 base64(DPAPI CryptProtectData，当前用户级)，**绑定本机+账户，跨机不可解**；解密失败或无密码 → `load_config` 返回 None → 静默触发重新输入。`--reset` 只清账号密码、保留间隔。
-- 断线检测间隔 `POLL_INTERVAL` 默认 5s、下限 `MIN_POLL_INTERVAL` 3s（2026-09-06 调低：黑洞探测零外部压力，旧 10s 下限是 1.1.1.1 轮询时代遗留）；config 手写值也会被 `max()` 兜底。`PROBE_TIMEOUT` 2s 决定在线 tick 固定耗时，改小 = 轮询更密。
+- 断线检测间隔 `POLL_INTERVAL` 默认 5s、下限 `MIN_POLL_INTERVAL` 3s（2026-09-06 调低：黑洞探测零外部压力，旧 10s 下限是 1.1.1.1 轮询时代遗留）；config 手写值也会被 `max()` 兜底。`PROBE_TIMEOUT` 2s 决定在线 tick 固定耗时，改小 = 轮询更密；**实际检测周期 ≈ 轮询间隔 + PROBE_TIMEOUT**（在线探测白等满超时），启动横幅按此文案显示。
 - 探测只发 `:80` 黑洞请求，对真实外部网络零打扰；**不要把轮询探测改回真实主机**（如旧版 1.1.1.1）——那是给外部服务加压力。
 
 ## 打包（auth.spec，PyInstaller one-folder）
 
 - `runtime_hooks=['hook_ort.py']`：frozen 时把 `_MEIPASS`、`onnxruntime/capi`、exe 所在目录 `os.add_dll_directory`（onnxruntime DLL 定位）。
-- 各库用 `collect_all` 收集；onnxruntime `capi` 目录全部 DLL 额外拷到根与 `onnxruntime/capi` 两处；Chromium headless shell 从 `%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*` 动态查找打进固定目标目录（**找不到只警告不报错** → 产物运行时缺浏览器，静默失败在 `pw.chromium.launch`）。
+- 各库用 `collect_all` 收集；onnxruntime `capi` 目录全部 DLL 额外拷到根与 `onnxruntime/capi` 两处；Chromium headless shell 从 `%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*` 动态查找（取含可执行文件的最新版本，目标目录名沿用源目录版本号，不硬编码 1228，防 playwright 升级后错位）（**找不到只警告不报错** → 产物运行时缺浏览器，静默失败在 `pw.chromium.launch`）。
 - `build\`（中间产物）与 `dist\`（产物）可随时重建。本机删除规范：一律回收站 `pwsh -File C:\Users\KI\bin\trash.ps1 <路径>`，勿用 rm/del。
+
+## 已知边界（2026-09-06 审查新增）
+
+- **2026-09-06 已实网复验通过**：确认探测三态化（`_is_released()` True/False/None，None=探测异常状态未知 → 本轮按失败处理，由下轮入口探测兜底）；Chromium launch 加 `--no-proxy-server`（探测本就直连 http.client，防系统代理把 Portal 请求送走）。复验记录：单次认证两次均"已确认在线"首探直判；watch 模式真实掉线（WAN IP 变更）后自动重连成功。None 分支与 3 轮全败退出路径未在实网触发（仅冒烟验证）。
+- **已知局限（未修，仅记录）**：
+  - 认证结果依赖 Portal 对 POST 直接返回结果页（`expect_response` 只抓首响应）；Portal 改 302 中间跳会退化为失败，届时看日志里的响应 URL/状态码定位。
+  - `PORTAL` 常量与网关 302 Location 是双源；换 Portal 服务器时 `/user/randomimage` 验证码 URL 需同步（可改为从 outer_url 推导 base）。
+  - 无单实例锁，双开 `--watch` 可能互踢账号造成抖动。
+  - FATAL_PATTERNS 匹配 Portal 中文返回文案 + `<div id="admin">` 结构，Portal 改版时致命错误会退化为普通失败重试（有 3 轮上限兜底）。
+- 输出编码：启动时 `sys.stdout.reconfigure(encoding="utf-8")`——stdout 被重定向（`> 日志`/管道/计划任务）时 Python 回落 GBK，编不了 ✓✗⚠ 会崩；`log()` 带 flush。

@@ -22,16 +22,24 @@ if ort_path:
             extra_binaries.append((full, '.'))
             extra_binaries.append((full, 'onnxruntime/capi'))
 
-# Chromium headless shell（动态查找，避免硬编码用户路径）
+# Chromium headless shell（动态查找，避免硬编码用户路径与版本号）
+# 本地可能残留多个版本：只收含可执行文件的候选，取版本号最新的一个；
+# 目标目录名沿用源目录版本号（playwright install 装了什么版本就带什么版本），
+# 不硬编码 1228——playwright 升级后硬编码版本会与安装版本错位，产物运行时静默缺浏览器。
 import glob
 local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 ms_pw_dir = os.path.join(local_appdata, "ms-playwright")
-chromium_dirs = glob.glob(os.path.join(ms_pw_dir, "chromium_headless_shell-*"))
-chromium_src = os.path.join(chromium_dirs[0], "chrome-headless-shell-win64") if chromium_dirs else ""
-chromium_dst = "playwright/driver/package/.local-browsers/chromium_headless_shell-1228/chrome-headless-shell-win64"
+candidates = []
+for d in glob.glob(os.path.join(ms_pw_dir, "chromium_headless_shell-*")):
+    if os.path.isdir(os.path.join(d, "chrome-headless-shell-win64")):
+        candidates.append(d)
 
 extra_datas = []
-if os.path.isdir(chromium_src):
+if candidates:
+    candidates.sort(reverse=True)
+    chromium_src = os.path.join(candidates[0], "chrome-headless-shell-win64")
+    rev = os.path.basename(candidates[0])
+    chromium_dst = f"playwright/driver/package/.local-browsers/{rev}/chrome-headless-shell-win64"
     print(f"找到 Chromium headless shell：{chromium_src}")
     extra_datas.append((chromium_src, chromium_dst))
 else:

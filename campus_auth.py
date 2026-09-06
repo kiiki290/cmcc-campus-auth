@@ -22,6 +22,12 @@ import socket
 import ctypes
 from ctypes import wintypes
 
+# 控制台输出统一 UTF-8：Windows 下 stdout 一旦是管道/重定向（> 日志、计划任务、
+# 管道捕获），Python 3.11 回落到 locale 编码（GBK），✓/✗/⚠ 等字符无法编码会抛
+# UnicodeEncodeError 把进程打崩（2026-09-06 审查发现并本机实测复现）。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 PORTAL        = "http://218.200.239.185:8888/portalserver"
 ANTIBOT       = re.compile(r"4QbVtADbnLVIc|\.a5bda9d\.", re.IGNORECASE)
@@ -106,7 +112,16 @@ def _decrypt(cipher: str) -> str | None:
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def wait_exit():
+    """等待用户按回车后退出。stdin 被关闭（计划任务/管道/后台运行）时 input() 抛
+    EOFError——无人值守场景直接放行退出即可，不要崩出 traceback。"""
+    try:
+        input("按回车键退出 ...")
+    except EOFError:
+        pass
 
 
 def load_config() -> dict | None:
@@ -127,6 +142,12 @@ def load_config() -> dict | None:
         else:
             # config 存在但没有密码（--reset 后保留的间隔），触发重新输入
             return None
+        # 学号缺失/非字符串（手写半截配置）同样触发重新输入，否则 main() 取键 KeyError
+        sid = cfg.get("student_id")
+        if not isinstance(sid, str) or not sid.strip():
+            log("⚠ 配置中的学号缺失或无效，请重新输入账号密码")
+            return None
+        cfg["student_id"] = sid.strip()
         cfg.setdefault("poll_interval", POLL_INTERVAL)
         # 防护：即使 config.json 中手写小于 MIN_POLL_INTERVAL 的值，也强制兜底
         cfg["poll_interval"] = max(cfg["poll_interval"], MIN_POLL_INTERVAL)
@@ -214,8 +235,10 @@ def _get_portal_url() -> str | None:
         conn.close()
 
 
-def _is_released() -> bool:
+def _is_released() -> bool | None:
     """认证后确认 BRAS 是否放行：GET 真实可达的 HTTP 端点。
+    三态：True=已放行；False=仍被网关 302 拦截（未放行）；None=探测异常
+    （网络瞬断等），状态未知——探测异常不等于"未放行"，勿混淆。
     放行 → 端点正常应答（如 Cloudflare 301 跳 https）；未放行 → 网关仍 302 拦截。
     与断线轮询不同，确认必须毫秒级区分两种状态，故目标用真实主机而非黑洞 IP——
     每次登录只此一次请求，外部负担可忽略。"""
@@ -235,7 +258,7 @@ def _is_released() -> bool:
         finally:
             conn.close()
     except Exception:
-        return False
+        return None
 
 
 def _load_ocr():
@@ -275,7 +298,9 @@ async def do_auth(student_id: str, password: str) -> bool:
 
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
+            # 禁系统代理：探测走直连 http.client，而 Chromium 默认跟随 Windows 系统
+            # 代理（Clash/V2Ray 等），两者不一致会让 Portal 请求被送进代理走错路径
+            args=["--disable-blink-features=AutomationControlled", "--no-proxy-server"]
         )
         try:
             context = await browser.new_context(
@@ -430,9 +455,16 @@ async def do_auth(student_id: str, password: str) -> bool:
             for delay in (0, 1, 2, 3, 5, 8):
                 if delay:
                     await asyncio.sleep(delay)
-                if _is_released():
+                state = _is_released()
+                if state is True:
                     log("✓ 已确认在线（BRAS 放行）")
                     return True
+                if state is None:
+                    # 探测异常（网络瞬断等）≠ 明确未放行：不再烧完剩余递增等待，
+                    # 本轮按失败处理，由外层重试的入口探测去区分"已放行/仍拦截/断网"，
+                    # 避免一次链路抖动把确认拖到 ~37s 再叠加整轮重试。
+                    log("  ⚠ 确认探测异常（状态未知），本轮按失败处理，稍后整轮重试")
+                    return False
                 if delay == 0:
                     log("  等待 BRAS 放行 ...")
             log("✗ 页面已接受但 BRAS 未放行，按失败重试")
@@ -455,7 +487,7 @@ def auth_with_retry(student_id: str, password: str) -> bool:
                 loop.close()
         except FatalAuthError as e:
             log(f"✗ 致命错误，不再重试：{e}")
-            input("按回车键退出 ...")
+            wait_exit()
             return False
         except Exception as e:
             log(f"认证异常：{e}")
@@ -470,7 +502,10 @@ def auth_with_retry(student_id: str, password: str) -> bool:
 
 # ── 断线监控模式 ──────────────────────────────────────────────────────────────
 def watch_mode(student_id: str, password: str, poll_interval: int = POLL_INTERVAL):
-    log(f"进入断线监控模式（每 {poll_interval} 秒检测一次），Ctrl+C 退出")
+    # 周期写实：在线时每轮探测要白等满 PROBE_TIMEOUT，检测周期 ≈ 间隔 + 探测超时；
+    # 掉线瞬间探测立即返回 302，故实际发现掉线不慢于一个周期
+    log(f"进入断线监控模式（间隔 {poll_interval}s，在线探测超时 {PROBE_TIMEOUT}s，"
+        f"检测周期约 {poll_interval + PROBE_TIMEOUT}s），Ctrl+C 退出")
     while True:
         try:
             offline = is_offline_sync()
@@ -487,7 +522,7 @@ def watch_mode(student_id: str, password: str, poll_interval: int = POLL_INTERVA
                             loop.close()
                     except FatalAuthError as e:
                         log(f"✗ 致命错误，停止监控：{e}")
-                        input("按回车键退出 ...")
+                        wait_exit()
                         sys.exit(1)
                     except Exception as e:
                         log(f"认证异常：{e}")
@@ -501,7 +536,7 @@ def watch_mode(student_id: str, password: str, poll_interval: int = POLL_INTERVA
                 else:
                     # 3 轮全部失败
                     log("✗ 断线后 3 轮认证均失败，可能原因：网络中断 / 账号异常 / 服务器故障")
-                    input("按回车键退出 ...")
+                    wait_exit()
                     sys.exit(1)
             else:
                 log("在线 ✓")
