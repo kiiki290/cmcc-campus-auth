@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+
+# PyInstaller 构建产物（build/ 中间产物、dist/ 产物均可随时重建）
+build/
+dist/
+
+# 本地真实配置（防御性：真配置在 %APPDATA%\campus_auth，不在项目内；
+# 万一在此生成也不入库。config.example.json 是模板，正常跟踪）
+config.json
