@@ -30,6 +30,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 PORTAL        = "http://218.200.239.185:8888/portalserver"
+# 瑞数（Riversec）动态防护引擎脚本的随机目录 / 文件名特征；命中后原样回放，
+# 确保浏览器内 JS 正常执行并生成 NT cookie（旧文档曾误记为腾讯云 WAF）。
 ANTIBOT       = re.compile(r"4QbVtADbnLVIc|\.a5bda9d\.", re.IGNORECASE)
 # 断线探测目标：TEST-NET-1 保留段（RFC 5737），全网不可路由、无任何服务应答——
 # 在线时探测必然无响应（不打扰任何外部服务），未认证时被网关（BRAS/NetEngine）
@@ -39,12 +41,12 @@ PROBE_TIMEOUT = 2  # 在线时每次探测等满该值；网关 302 为本地毫
                    # 留足 WLAN 重传余量；同时决定在线 tick 的固定耗时，越小轮询越密
 CONFIG_DIR    = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "campus_auth")
 CONFIG_FILE   = os.path.join(CONFIG_DIR, "config.json")
-POLL_INTERVAL     = 5    # 断线检测间隔默认值（秒），config.json 可覆盖；2026-09-06 由 15
-                        # 调低：黑洞探测零外部压力，5s 处于甜点区（检测延迟 ~7s）
-MIN_POLL_INTERVAL = 3    # 最小间隔下限。轮询不碰 Portal/WAF（仅认证时碰），黑洞探测
-                        # 零外部压力——旧的 10s 下限（防 1.1.1.1 压力）已随 BLACKHOLE_IP 失效；
+POLL_INTERVAL     = 5    # 断线检测间隔默认值（秒），config.json 可覆盖；2026-09-06 由旧项目
+                        # 的 15 调低：黑洞探测零外部压力，5s 处于甜点区（检测延迟 ~7s）
+MIN_POLL_INTERVAL = 3    # 最小间隔下限。轮询不碰 Portal/瑞数 WAF（仅认证时碰），黑洞探测
+                        # 零外部压力——旧项目 10s 下限（防 1.1.1.1 压力）已随 BLACKHOLE_IP 失效；
                         # 实际甜点在 3-5s：检测延迟 = 间隔 + PROBE_TIMEOUT + 认证 ~6-8s
-MAX_RETRY         = 3    # 单次认证最大重试次数
+MAX_RETRY         = 3    # 单次认证最大尝试次数（含首次；即首次 + 2 次重试）
 
 # 服务器返回中包含以下关键词时，判定为「不应重试」的致命错误
 FATAL_PATTERNS = [
@@ -240,8 +242,8 @@ def _is_released() -> bool | None:
     三态：True=已放行；False=仍被网关 302 拦截（未放行）；None=探测异常
     （网络瞬断等），状态未知——探测异常不等于"未放行"，勿混淆。
     放行 → 端点正常应答（如 Cloudflare 301 跳 https）；未放行 → 网关仍 302 拦截。
-    与断线轮询不同，确认必须毫秒级区分两种状态，故目标用真实主机而非黑洞 IP——
-    每次登录只此一次请求，外部负担可忽略。"""
+    端点正常应答时毫秒级，探测异常时单次探测超时设为 3s；确认目标用真实主机而非黑洞 IP，
+    因为放行态下黑洞探测要白等满 PROBE_TIMEOUT（每次登录仅确认请求，外部负担可忽略）。"""
     try:
         conn = http.client.HTTPConnection("1.1.1.1", timeout=3)
         try:
@@ -281,6 +283,7 @@ async def do_auth(student_id: str, password: str) -> bool:
         log("✓ 已在线，无需认证")
         return True
     except OSError as e:
+        # 与 is_offline_sync() 不同：单次认证无法把"网卡不可用"当作在线，按失败处理
         log(f"  网络不可达（errno {e.errno or '?'}），无法确认认证状态")
         return False
     if not outer_url:
@@ -303,6 +306,10 @@ async def do_auth(student_id: str, password: str) -> bool:
             args=["--disable-blink-features=AutomationControlled", "--no-proxy-server"]
         )
         try:
+            # UA 的作用是去掉 Chromium 默认的 HeadlessChrome 标记（瑞数首层按 UA
+            # 分流）；版本号固定为 Chrome/124，实网可用。Playwright 升级后实际
+            # Chromium 版本会变（本机 1.61 为 149.0.7827.55），如需严格一致可从
+            # browser.version 动态生成（未实网验证）。
             context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -442,16 +449,17 @@ async def do_auth(student_id: str, password: str) -> bool:
 
             page_ok = title == "登录成功" or "logout" in text or "online" in text
             if not page_ok:
-                # 服务器返回了意外内容（可能是 WAF 拦截或 Portal 异常）
+                # 服务器返回了意外内容（可能是瑞数 WAF 拦截或 Portal 异常）
                 preview = text[:200].replace("\n", " ")
                 log(f"✗ 服务器返回异常响应：{preview}")
                 return False
 
             log(f"✓ 认证成功！{admin_text}" if admin_text else "✓ 认证成功！")
             # 页面成功 ≠ BRAS 已放行（姊妹项目 CampusAuth 实测）：POST 返回后立即探测，
-            # 未放行则 1/2/3/5/8s 递增重试（总窗口 ~19s，覆盖 BRAS 慢放行，避免误触发整轮重试）。
-            # 确认用 _is_released() 的真实主机毫秒级探测，而非黑洞 IP——后者"放行=无应答"
-            # 每轮要白等满 PROBE_TIMEOUT，会把确认拖慢 ~3s
+            # 未放行则按 0/1/2/3/5/8s 递增等待（sleep 合计 ~19s，按每次探测 3s 估算最坏 ~37s，
+            # 覆盖 BRAS 慢放行，避免误触发整轮重试）。
+            # 确认用 _is_released() 的真实主机探测（正常应答毫秒级），而非黑洞 IP——
+            # 后者"放行=无应答"，6 次探测各要白等满 PROBE_TIMEOUT（2s），会把确认拖慢 ~12s
             for delay in (0, 1, 2, 3, 5, 8):
                 if delay:
                     await asyncio.sleep(delay)
@@ -479,7 +487,8 @@ def auth_with_retry(student_id: str, password: str) -> bool:
         if attempt > 1:
             log(f"第 {attempt}/{MAX_RETRY} 次尝试 ...")
         try:
-            # 每次重试创建全新事件循环，避免 asyncio.run() 重入异常
+            # 每次重试创建全新事件循环；asyncio.run() 不能在已有事件循环中嵌套调用，
+            # 新建循环也用于隔离 Playwright 连接
             loop = asyncio.new_event_loop()
             try:
                 result = loop.run_until_complete(do_auth(student_id, password))

@@ -25,7 +25,7 @@ if ort_path:
 # Chromium headless shell（动态查找，避免硬编码用户路径与版本号）
 # 本地可能残留多个版本：只收含可执行文件的候选，取版本号最新的一个；
 # 目标目录名沿用源目录版本号（playwright install 装了什么版本就带什么版本），
-# 不硬编码 1228——playwright 升级后硬编码版本会与安装版本错位，产物运行时静默缺浏览器。
+# 不硬编码 1228——playwright 升级后硬编码版本会与安装版本错位，产物运行时会在 launch 处报缺浏览器。
 import glob
 local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 ms_pw_dir = os.path.join(local_appdata, "ms-playwright")
